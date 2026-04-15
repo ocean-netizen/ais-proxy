@@ -24,9 +24,11 @@ CORS(app)
 ORIGIN = "https://aisstream.io"
 
 
-@app.route("/health", methods=["GET"])
+@app.route("/health", methods=["GET", "HEAD"])
+@app.route("/", methods=["GET", "HEAD"])
 def health():
     return jsonify({"ok": True, "service": "AIS Proxy"})
+
 
 
 @app.route("/ais", methods=["POST", "OPTIONS"])
