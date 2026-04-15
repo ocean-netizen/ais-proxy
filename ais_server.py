@@ -74,35 +74,35 @@ def scrape_position(mmsi, vessel_name='', imo=''):
         url = f"https://www.myshiptracking.com/vessels/{slug}-mmsi-{mmsi}-imo-{imo or 0}"
         print(f"[scrape] {mmsi}: {url}", flush=True)
 
-        r = http_req.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+        session = http_req.Session()
+        session.headers.update(HEADERS)
+        # 먼저 홈페이지 방문해서 쿠키 획득
+        session.get("https://www.myshiptracking.com/", timeout=5)
+
+        r = session.get(url, timeout=10, allow_redirects=True)
         print(f"[scrape] {mmsi}: status {r.status_code}", flush=True)
 
         if r.status_code != 200:
             url2 = f"https://www.myshiptracking.com/vessels/v-mmsi-{mmsi}-imo-{imo or 0}"
-            r = http_req.get(url2, headers=HEADERS, timeout=10, allow_redirects=True)
+            r = session.get(url2, timeout=10, allow_redirects=True)
             if r.status_code != 200:
                 return None
 
         text = r.text
-
-        # 선박명: <h1> 태그
         name_m = re.search(r'<h1[^>]*>([^<]+)</h1>', text)
         ship_name = name_m.group(1).strip() if name_m else vessel_name
 
-        # 좌표: "-26.27357° / 153.42024°"
         lat, lng = None, None
         coord_m = re.findall(r'(-?\d+\.\d{3,6})\s*°?\s*/\s*(-?\d+\.\d{3,6})', text)
         if coord_m:
             lat = float(coord_m[0][0])
             lng = float(coord_m[0][1])
 
-        # 속도
         speed = 0
         spd_m = re.search(r'(\d+\.?\d*)\s*(?:Knots|kn)', text, re.IGNORECASE)
         if spd_m:
             speed = float(spd_m.group(1))
 
-        # 방향
         course = 0
         crs_m = re.search(r'Course[:\s]*(\d+\.?\d*)\s*°', text, re.IGNORECASE)
         if crs_m:
@@ -127,6 +127,7 @@ def scrape_position(mmsi, vessel_name='', imo=''):
     except Exception as e:
         print(f"[scrape] {mmsi} error: {e}", flush=True)
         return None
+
 
 
 if __name__ == "__main__":
