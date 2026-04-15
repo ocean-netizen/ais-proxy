@@ -1,5 +1,5 @@
 """
-AIS Proxy — MyShipTracking scraping for last known position
+AIS Proxy v3 — regex-only scraping (no BeautifulSoup)
 Ultra-light for Render free 512MB
 """
 import json
@@ -10,14 +10,13 @@ import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests as http_req
-from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 CORS(app)
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'text/html,application/xhtml+xml',
     'Accept-Language': 'en-US,en;q=0.5',
 }
 
@@ -49,75 +48,73 @@ def ais_proxy():
         mmsi = str(v.get("mmsi", ""))
         if not mmsi:
             continue
-        pos = scrape_myshiptracking(mmsi, v.get("name", ""), v.get("imo", ""))
+        pos = scrape_position(mmsi, v.get("name", ""), v.get("imo", ""))
         if pos:
             positions[mmsi] = pos
 
     return jsonify(positions)
 
 
-def scrape_myshiptracking(mmsi, vessel_name='', imo=''):
+def scrape_position(mmsi, vessel_name='', imo=''):
     try:
-        slug = vessel_name.lower().replace(' ', '-').replace('.', '-') if vessel_name else 'vessel'
+        slug = vessel_name.lower().replace(' ', '-') if vessel_name else 'vessel'
         slug = re.sub(r'[^a-z0-9-]', '', slug)
         slug = re.sub(r'-+', '-', slug).strip('-') or 'vessel'
-        detail_url = f"https://www.myshiptracking.com/vessels/{slug}-mmsi-{mmsi}-imo-{imo or 0}"
-        print(f"[scrape] MMSI {mmsi}: trying {detail_url}", flush=True)
+        url = f"https://www.myshiptracking.com/vessels/{slug}-mmsi-{mmsi}-imo-{imo or 0}"
+        print(f"[scrape] {mmsi}: {url}", flush=True)
 
-        r = http_req.get(detail_url, headers=HEADERS, timeout=10, allow_redirects=True)
-        print(f"[scrape] MMSI {mmsi}: status {r.status_code}", flush=True)
+        r = http_req.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+        print(f"[scrape] {mmsi}: status {r.status_code}", flush=True)
 
         if r.status_code != 200:
-            alt_url = f"https://www.myshiptracking.com/vessels/vessel-mmsi-{mmsi}-imo-{imo or 0}"
-            print(f"[scrape] MMSI {mmsi}: trying alt {alt_url}", flush=True)
-            r = http_req.get(alt_url, headers=HEADERS, timeout=10, allow_redirects=True)
+            url2 = f"https://www.myshiptracking.com/vessels/v-mmsi-{mmsi}-imo-{imo or 0}"
+            r = http_req.get(url2, headers=HEADERS, timeout=10, allow_redirects=True)
             if r.status_code != 200:
-                print(f"[scrape] MMSI {mmsi}: failed status {r.status_code}", flush=True)
                 return None
 
         text = r.text
-        soup = BeautifulSoup(text, 'html.parser')
 
-        ship_name = vessel_name
-        h1 = soup.find('h1')
-        if h1:
-            ship_name = h1.get_text(strip=True)
+        # 선박명: <h1> 태그
+        name_m = re.search(r'<h1[^>]*>([^<]+)</h1>', text)
+        ship_name = name_m.group(1).strip() if name_m else vessel_name
 
+        # 좌표: "-26.27357° / 153.42024°"
         lat, lng = None, None
-        speed, course = 0, 0
+        coord_m = re.findall(r'(-?\d+\.\d{3,6})\s*°?\s*/\s*(-?\d+\.\d{3,6})', text)
+        if coord_m:
+            lat = float(coord_m[0][0])
+            lng = float(coord_m[0][1])
 
-        coord_matches = re.findall(r'(-?\d+\.\d{3,6})\s*°?\s*/\s*(-?\d+\.\d{3,6})', text)
-        if coord_matches:
-            lat = float(coord_matches[0][0])
-            lng = float(coord_matches[0][1])
-
-        spd_m = re.search(r'(\d+\.?\d*)\s*(?:Knots|kn|kt)', text, re.IGNORECASE)
+        # 속도
+        speed = 0
+        spd_m = re.search(r'(\d+\.?\d*)\s*(?:Knots|kn)', text, re.IGNORECASE)
         if spd_m:
             speed = float(spd_m.group(1))
 
+        # 방향
+        course = 0
         crs_m = re.search(r'Course[:\s]*(\d+\.?\d*)\s*°', text, re.IGNORECASE)
         if crs_m:
             course = int(float(crs_m.group(1)))
 
         if lat is None or lng is None:
-            print(f"[scrape] MMSI {mmsi}: coords not found in page", flush=True)
+            print(f"[scrape] {mmsi}: no coords found", flush=True)
             return None
 
-        print(f"[scrape] MMSI {mmsi}: {ship_name} at {lat}, {lng}", flush=True)
+        print(f"[scrape] {mmsi}: OK {ship_name} {lat},{lng}", flush=True)
         return {
             "lat": round(lat, 6),
             "lng": round(lng, 6),
             "speed": round(speed, 1),
             "heading": course,
             "name": ship_name,
-            "time_utc": "",
             "timestamp": int(time.time()),
             "is_live": False,
             "age_seconds": 0,
             "source": "myshiptracking"
         }
     except Exception as e:
-        print(f"[scrape] MMSI {mmsi} error: {e}", flush=True)
+        print(f"[scrape] {mmsi} error: {e}", flush=True)
         return None
 
 
