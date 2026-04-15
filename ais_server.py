@@ -36,61 +36,53 @@ def ais_proxy():
         return "", 204
 
     body = request.get_json(force=True, silent=True) or {}
-    mmsi_list = [str(m) for m in body.get("mmsi_list", [])]
+    vessels = body.get("vessels", [])
+    if not vessels:
+        mmsi_list = [str(m) for m in body.get("mmsi_list", [])]
+        vessels = [{"mmsi": m} for m in mmsi_list]
 
-    if not mmsi_list:
-        return jsonify({"error": "mmsi_list required"}), 400
+    if not vessels:
+        return jsonify({"error": "vessels or mmsi_list required"}), 400
 
     positions = {}
-    for mmsi in mmsi_list:
-        pos = scrape_myshiptracking(mmsi)
+    for v in vessels:
+        mmsi = str(v.get("mmsi", ""))
+        if not mmsi:
+            continue
+        pos = scrape_myshiptracking(mmsi, v.get("name", ""), v.get("imo", ""))
         if pos:
             positions[mmsi] = pos
 
     return jsonify(positions)
 
 
-def scrape_myshiptracking(mmsi):
-    """MyShipTracking에서 MMSI로 선박 마지막 위치 스크래핑"""
+def scrape_myshiptracking(mmsi, vessel_name='', imo=''):
     try:
-        # 1단계: 검색 페이지에서 상세 페이지 링크 찾기
-        search_url = f"https://www.myshiptracking.com/vessels?mmsi={mmsi}"
-        r = http_req.get(search_url, headers=HEADERS, timeout=10)
+        slug = vessel_name.lower().replace(' ', '-').replace('.', '-') if vessel_name else 'vessel'
+        slug = re.sub(r'[^a-z0-9-]', '', slug)
+        slug = re.sub(r'-+', '-', slug).strip('-') or 'vessel'
+        detail_url = f"https://www.myshiptracking.com/vessels/{slug}-mmsi-{mmsi}-imo-{imo or 0}"
+        print(f"[scrape] MMSI {mmsi}: trying {detail_url}", flush=True)
+
+        r = http_req.get(detail_url, headers=HEADERS, timeout=10, allow_redirects=True)
+        print(f"[scrape] MMSI {mmsi}: status {r.status_code}", flush=True)
+
         if r.status_code != 200:
-            return None
+            alt_url = f"https://www.myshiptracking.com/vessels/vessel-mmsi-{mmsi}-imo-{imo or 0}"
+            print(f"[scrape] MMSI {mmsi}: trying alt {alt_url}", flush=True)
+            r = http_req.get(alt_url, headers=HEADERS, timeout=10, allow_redirects=True)
+            if r.status_code != 200:
+                print(f"[scrape] MMSI {mmsi}: failed status {r.status_code}", flush=True)
+                return None
 
-        soup = BeautifulSoup(r.text, 'html.parser')
+        text = r.text
+        soup = BeautifulSoup(text, 'html.parser')
 
-        # mmsi가 포함된 상세 페이지 링크 찾기
-        detail_path = None
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            if f'mmsi-{mmsi}' in href and '/vessels/' in href:
-                detail_path = href
-                break
-
-        if not detail_path:
-            print(f"[scrape] MMSI {mmsi}: detail link not found on search page")
-            return None
-
-        # 2단계: 상세 페이지에서 위치 데이터 추출
-        detail_url = 'https://www.myshiptracking.com' + detail_path if not detail_path.startswith('http') else detail_path
-        print(f"[scrape] MMSI {mmsi}: fetching {detail_url}")
-
-        r2 = http_req.get(detail_url, headers=HEADERS, timeout=10)
-        if r2.status_code != 200:
-            return None
-
-        text = r2.text
-        soup2 = BeautifulSoup(text, 'html.parser')
-
-        # 선박명
-        ship_name = ''
-        h1 = soup2.find('h1')
+        ship_name = vessel_name
+        h1 = soup.find('h1')
         if h1:
             ship_name = h1.get_text(strip=True)
 
-        # 좌표 추출: "-26.27357° / 153.42024°" 패턴
         lat, lng = None, None
         speed, course = 0, 0
 
@@ -99,21 +91,19 @@ def scrape_myshiptracking(mmsi):
             lat = float(coord_matches[0][0])
             lng = float(coord_matches[0][1])
 
-        # 속도: "16.7 Knots"
         spd_m = re.search(r'(\d+\.?\d*)\s*(?:Knots|kn|kt)', text, re.IGNORECASE)
         if spd_m:
             speed = float(spd_m.group(1))
 
-        # 방향: "Course: 23.2°"
         crs_m = re.search(r'Course[:\s]*(\d+\.?\d*)\s*°', text, re.IGNORECASE)
         if crs_m:
             course = int(float(crs_m.group(1)))
 
         if lat is None or lng is None:
-            print(f"[scrape] MMSI {mmsi}: coords not found in detail page")
+            print(f"[scrape] MMSI {mmsi}: coords not found in page", flush=True)
             return None
 
-        print(f"[scrape] MMSI {mmsi}: {ship_name} at {lat}, {lng}")
+        print(f"[scrape] MMSI {mmsi}: {ship_name} at {lat}, {lng}", flush=True)
         return {
             "lat": round(lat, 6),
             "lng": round(lng, 6),
@@ -127,9 +117,8 @@ def scrape_myshiptracking(mmsi):
             "source": "myshiptracking"
         }
     except Exception as e:
-        print(f"[scrape] MMSI {mmsi} error: {e}")
+        print(f"[scrape] MMSI {mmsi} error: {e}", flush=True)
         return None
-
 
 
 if __name__ == "__main__":
