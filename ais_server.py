@@ -53,7 +53,7 @@ def ais_proxy():
 def scrape_myshiptracking(mmsi):
     """MyShipTracking에서 MMSI로 선박 마지막 위치 스크래핑"""
     try:
-        # 1단계: 검색으로 선박 상세 페이지 URL 찾기
+        # 1단계: 검색 페이지에서 상세 페이지 링크 찾기
         search_url = f"https://www.myshiptracking.com/vessels?mmsi={mmsi}"
         r = http_req.get(search_url, headers=HEADERS, timeout=10)
         if r.status_code != 200:
@@ -61,27 +61,28 @@ def scrape_myshiptracking(mmsi):
 
         soup = BeautifulSoup(r.text, 'html.parser')
 
-        # 상세 페이지 링크 찾기 (mmsi가 URL에 포함된 링크)
-        detail_url = None
+        # mmsi가 포함된 상세 페이지 링크 찾기
+        detail_path = None
         for a in soup.find_all('a', href=True):
-            if f'mmsi-{mmsi}' in a['href']:
-                href = a['href']
-                if not href.startswith('http'):
-                    href = 'https://www.myshiptracking.com' + href
-                detail_url = href
+            href = a['href']
+            if f'mmsi-{mmsi}' in href and '/vessels/' in href:
+                detail_path = href
                 break
 
-        if not detail_url:
-            # 직접 URL 패턴 시도
-            detail_url = f"https://www.myshiptracking.com/vessels?mmsi={mmsi}"
+        if not detail_path:
+            print(f"[scrape] MMSI {mmsi}: detail link not found on search page")
+            return None
 
         # 2단계: 상세 페이지에서 위치 데이터 추출
+        detail_url = 'https://www.myshiptracking.com' + detail_path if not detail_path.startswith('http') else detail_path
+        print(f"[scrape] MMSI {mmsi}: fetching {detail_url}")
+
         r2 = http_req.get(detail_url, headers=HEADERS, timeout=10)
         if r2.status_code != 200:
             return None
 
-        soup2 = BeautifulSoup(r2.text, 'html.parser')
-        text = soup2.get_text()
+        text = r2.text
+        soup2 = BeautifulSoup(text, 'html.parser')
 
         # 선박명
         ship_name = ''
@@ -89,50 +90,30 @@ def scrape_myshiptracking(mmsi):
         if h1:
             ship_name = h1.get_text(strip=True)
 
-        # 좌표 추출
+        # 좌표 추출: "-26.27357° / 153.42024°" 패턴
         lat, lng = None, None
         speed, course = 0, 0
 
-        # 패턴: -26.27357° / 153.42024° 또는 유사
-        coord_matches = re.findall(r'(-?\d+\.\d{3,6})\s*[°]?\s*/\s*(-?\d+\.\d{3,6})', text)
+        coord_matches = re.findall(r'(-?\d+\.\d{3,6})\s*°?\s*/\s*(-?\d+\.\d{3,6})', text)
         if coord_matches:
             lat = float(coord_matches[0][0])
             lng = float(coord_matches[0][1])
 
-        # 속도 추출
+        # 속도: "16.7 Knots"
         spd_m = re.search(r'(\d+\.?\d*)\s*(?:Knots|kn|kt)', text, re.IGNORECASE)
         if spd_m:
             speed = float(spd_m.group(1))
 
-        # 방향 추출
+        # 방향: "Course: 23.2°"
         crs_m = re.search(r'Course[:\s]*(\d+\.?\d*)\s*°', text, re.IGNORECASE)
         if crs_m:
             course = int(float(crs_m.group(1)))
 
-        # meta 태그에서도 시도
-        if lat is None:
-            for meta in soup2.find_all('meta'):
-                content = meta.get('content', '')
-                geo_m = re.search(r'(-?\d+\.\d+)[,;\s]+(-?\d+\.\d+)', content)
-                if geo_m:
-                    lat = float(geo_m.group(1))
-                    lng = float(geo_m.group(2))
-                    break
-
-        # script 태그에서도 시도
-        if lat is None:
-            for script in soup2.find_all('script'):
-                txt = script.string or ''
-                lat_m = re.search(r'lat["\']?\s*[:=]\s*(-?\d+\.\d+)', txt)
-                lng_m = re.search(r'(?:lng|lon)["\']?\s*[:=]\s*(-?\d+\.\d+)', txt)
-                if lat_m and lng_m:
-                    lat = float(lat_m.group(1))
-                    lng = float(lng_m.group(1))
-                    break
-
         if lat is None or lng is None:
+            print(f"[scrape] MMSI {mmsi}: coords not found in detail page")
             return None
 
+        print(f"[scrape] MMSI {mmsi}: {ship_name} at {lat}, {lng}")
         return {
             "lat": round(lat, 6),
             "lng": round(lng, 6),
@@ -148,6 +129,7 @@ def scrape_myshiptracking(mmsi):
     except Exception as e:
         print(f"[scrape] MMSI {mmsi} error: {e}")
         return None
+
 
 
 if __name__ == "__main__":
