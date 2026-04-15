@@ -1,24 +1,31 @@
 """
-AIS Proxy — ultra-light for Render free 512MB
-No websocket libs, uses subprocess for minimal memory
+AIS Proxy — VesselFinder scraping + AISStream fallback
+Ultra-light for Render free 512MB
 """
 import json
+import re
 import time
 import os
-import subprocess
-import sys
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests as http_req
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 CORS(app)
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+}
 
 
 @app.route("/health", methods=["GET", "HEAD"])
 @app.route("/", methods=["GET", "HEAD"])
 def health():
-    return jsonify({"ok": True, "service": "AIS Proxy"})
+    return jsonify({"ok": True, "service": "AIS Proxy v2"})
 
 
 @app.route("/ais", methods=["POST", "OPTIONS"])
@@ -29,85 +36,104 @@ def ais_proxy():
         return "", 204
 
     body = request.get_json(force=True, silent=True) or {}
-    api_key = body.get("api_key", "").strip()
     mmsi_list = [str(m) for m in body.get("mmsi_list", [])]
 
-    if not api_key:
-        return jsonify({"error": "api_key required"}), 400
+    if not mmsi_list:
+        return jsonify({"error": "mmsi_list required"}), 400
 
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", FETCH_SCRIPT],
-            input=json.dumps({"api_key": api_key, "mmsi_list": mmsi_list}),
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return jsonify(json.loads(result.stdout.strip()))
-        return jsonify({})
-    except subprocess.TimeoutExpired:
-        return jsonify({})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-FETCH_SCRIPT = '''
-import asyncio, json, sys, time
-
-async def main():
-    import websockets
-    data = json.loads(sys.stdin.read())
-    api_key = data["api_key"]
-    mmsi_list = data["mmsi_list"]
     positions = {}
-    targets = set(mmsi_list)
-    now_ts = int(time.time())
-    sub = {
-        "APIKey": api_key,
-        "BoundingBoxes": [[[-90, -180], [90, 180]]],
-        "FilterMessageTypes": ["PositionReport"],
-    }
-    if mmsi_list:
-        sub["FiltersShipMMSI"] = mmsi_list
-    try:
-        async with websockets.connect(
-            "wss://stream.aisstream.io/v0/stream",
-            additional_headers={"Origin": "https://aisstream.io"},
-            open_timeout=5,
-        ) as ws:
-            await ws.send(json.dumps(sub))
-            deadline = asyncio.get_event_loop().time() + 8
-            async for raw in ws:
-                if asyncio.get_event_loop().time() > deadline:
-                    break
-                if targets and positions.keys() >= targets:
-                    break
-                try:
-                    d = json.loads(raw)
-                    if d.get("error"): break
-                    meta = d.get("Metadata") or d.get("MetaData", {})
-                    pr = d.get("Message", {}).get("PositionReport", {})
-                    mmsi = str(meta.get("MMSI", ""))
-                    if not mmsi or (targets and mmsi not in targets): continue
-                    lat = meta.get("Latitude") or pr.get("Latitude")
-                    lng = meta.get("Longitude") or pr.get("Longitude")
-                    if lat is None: continue
-                    positions[mmsi] = {
-                        "lat": round(float(lat), 6),
-                        "lng": round(float(lng), 6),
-                        "speed": round(float(pr.get("Sog") or 0), 1),
-                        "heading": int(pr.get("TrueHeading") or pr.get("Cog") or 0),
-                        "name": meta.get("ShipName", "").strip(),
-                        "time_utc": meta.get("time_utc", ""),
-                        "timestamp": now_ts,
-                        "is_live": True,
-                        "age_seconds": 0,
-                    }
-                except: pass
-    except: pass
-    print(json.dumps(positions))
+    for mmsi in mmsi_list:
+        pos = scrape_vesselfinder(mmsi)
+        if pos:
+            positions[mmsi] = pos
 
-asyncio.run(main())
-'''
+    return jsonify(positions)
+
+
+def scrape_vesselfinder(mmsi):
+    """VesselFinder에서 MMSI로 선박 마지막 위치 스크래핑"""
+    try:
+        url = f"https://www.vesselfinder.com/?mmsi={mmsi}"
+        r = http_req.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+        if r.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(r.text, 'html.parser')
+
+        # 선박명
+        name_el = soup.find('h1') or soup.find('title')
+        ship_name = ''
+        if name_el:
+            ship_name = name_el.get_text(strip=True).split('-')[0].strip()
+            ship_name = ship_name.replace('Ship', '').replace('Vessel', '').strip()
+
+        # 좌표: meta tag 또는 테이블에서 추출
+        lat, lng = None, None
+        speed, heading = 0, 0
+
+        # 방법1: og:image 또는 script에서 좌표 추출
+        for script in soup.find_all('script'):
+            txt = script.string or ''
+            # lat/lng 패턴
+            lat_m = re.search(r'["\']lat["\']?\s*[:=]\s*(-?\d+\.?\d*)', txt)
+            lng_m = re.search(r'["\'](?:lng|lon)["\']?\s*[:=]\s*(-?\d+\.?\d*)', txt)
+            if lat_m and lng_m:
+                lat = float(lat_m.group(1))
+                lng = float(lng_m.group(1))
+            # speed
+            spd_m = re.search(r'["\']speed["\']?\s*[:=]\s*(\d+\.?\d*)', txt)
+            if spd_m:
+                speed = float(spd_m.group(1))
+            # heading/course
+            hdg_m = re.search(r'["\'](?:heading|course)["\']?\s*[:=]\s*(\d+\.?\d*)', txt)
+            if hdg_m:
+                heading = int(float(hdg_m.group(1)))
+
+        # 방법2: 테이블 td에서 좌표 추출
+        if lat is None:
+            for td in soup.find_all('td'):
+                txt = td.get_text(strip=True)
+                # "35.12345 / 129.12345" 패턴
+                coord_m = re.match(r'(-?\d+\.\d+)\s*/\s*(-?\d+\.\d+)', txt)
+                if coord_m:
+                    lat = float(coord_m.group(1))
+                    lng = float(coord_m.group(2))
+                    break
+                # "N 35° 12.345" 패턴
+                dms_m = re.match(r'([NS])\s*(\d+)[°]\s*(\d+\.?\d*)', txt)
+                if dms_m:
+                    d = float(dms_m.group(2)) + float(dms_m.group(3)) / 60
+                    if dms_m.group(1) == 'S': d = -d
+                    lat = d
+
+        # 방법3: 링크에서 좌표 추출
+        if lat is None:
+            for a in soup.find_all('a', href=True):
+                m = re.search(r'centerx=(-?\d+\.?\d*)&centery=(-?\d+\.?\d*)', a['href'])
+                if m:
+                    lng = float(m.group(1))
+                    lat = float(m.group(2))
+                    break
+
+        if lat is None or lng is None:
+            return None
+
+        return {
+            "lat": round(lat, 6),
+            "lng": round(lng, 6),
+            "speed": round(speed, 1),
+            "heading": heading,
+            "name": ship_name,
+            "time_utc": "",
+            "timestamp": int(time.time()),
+            "is_live": False,
+            "age_seconds": 0,
+            "source": "vesselfinder"
+        }
+    except Exception as e:
+        print(f"[scrape] MMSI {mmsi} error: {e}")
+        return None
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
