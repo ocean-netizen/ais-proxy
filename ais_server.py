@@ -1,5 +1,5 @@
 """
-AIS Proxy — VesselFinder scraping + AISStream fallback
+AIS Proxy — MyShipTracking scraping for last known position
 Ultra-light for Render free 512MB
 """
 import json
@@ -25,7 +25,7 @@ HEADERS = {
 @app.route("/health", methods=["GET", "HEAD"])
 @app.route("/", methods=["GET", "HEAD"])
 def health():
-    return jsonify({"ok": True, "service": "AIS Proxy v2"})
+    return jsonify({"ok": True, "service": "AIS Proxy v3"})
 
 
 @app.route("/ais", methods=["POST", "OPTIONS"])
@@ -43,76 +43,91 @@ def ais_proxy():
 
     positions = {}
     for mmsi in mmsi_list:
-        pos = scrape_vesselfinder(mmsi)
+        pos = scrape_myshiptracking(mmsi)
         if pos:
             positions[mmsi] = pos
 
     return jsonify(positions)
 
 
-def scrape_vesselfinder(mmsi):
-    """VesselFinder에서 MMSI로 선박 마지막 위치 스크래핑"""
+def scrape_myshiptracking(mmsi):
+    """MyShipTracking에서 MMSI로 선박 마지막 위치 스크래핑"""
     try:
-        url = f"https://www.vesselfinder.com/?mmsi={mmsi}"
-        r = http_req.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+        # 1단계: 검색으로 선박 상세 페이지 URL 찾기
+        search_url = f"https://www.myshiptracking.com/vessels?mmsi={mmsi}"
+        r = http_req.get(search_url, headers=HEADERS, timeout=10)
         if r.status_code != 200:
             return None
 
         soup = BeautifulSoup(r.text, 'html.parser')
 
+        # 상세 페이지 링크 찾기 (mmsi가 URL에 포함된 링크)
+        detail_url = None
+        for a in soup.find_all('a', href=True):
+            if f'mmsi-{mmsi}' in a['href']:
+                href = a['href']
+                if not href.startswith('http'):
+                    href = 'https://www.myshiptracking.com' + href
+                detail_url = href
+                break
+
+        if not detail_url:
+            # 직접 URL 패턴 시도
+            detail_url = f"https://www.myshiptracking.com/vessels?mmsi={mmsi}"
+
+        # 2단계: 상세 페이지에서 위치 데이터 추출
+        r2 = http_req.get(detail_url, headers=HEADERS, timeout=10)
+        if r2.status_code != 200:
+            return None
+
+        soup2 = BeautifulSoup(r2.text, 'html.parser')
+        text = soup2.get_text()
+
         # 선박명
-        name_el = soup.find('h1') or soup.find('title')
         ship_name = ''
-        if name_el:
-            ship_name = name_el.get_text(strip=True).split('-')[0].strip()
-            ship_name = ship_name.replace('Ship', '').replace('Vessel', '').strip()
+        h1 = soup2.find('h1')
+        if h1:
+            ship_name = h1.get_text(strip=True)
 
-        # 좌표: meta tag 또는 테이블에서 추출
+        # 좌표 추출
         lat, lng = None, None
-        speed, heading = 0, 0
+        speed, course = 0, 0
 
-        # 방법1: og:image 또는 script에서 좌표 추출
-        for script in soup.find_all('script'):
-            txt = script.string or ''
-            # lat/lng 패턴
-            lat_m = re.search(r'["\']lat["\']?\s*[:=]\s*(-?\d+\.?\d*)', txt)
-            lng_m = re.search(r'["\'](?:lng|lon)["\']?\s*[:=]\s*(-?\d+\.?\d*)', txt)
-            if lat_m and lng_m:
-                lat = float(lat_m.group(1))
-                lng = float(lng_m.group(1))
-            # speed
-            spd_m = re.search(r'["\']speed["\']?\s*[:=]\s*(\d+\.?\d*)', txt)
-            if spd_m:
-                speed = float(spd_m.group(1))
-            # heading/course
-            hdg_m = re.search(r'["\'](?:heading|course)["\']?\s*[:=]\s*(\d+\.?\d*)', txt)
-            if hdg_m:
-                heading = int(float(hdg_m.group(1)))
+        # 패턴: -26.27357° / 153.42024° 또는 유사
+        coord_matches = re.findall(r'(-?\d+\.\d{3,6})\s*[°]?\s*/\s*(-?\d+\.\d{3,6})', text)
+        if coord_matches:
+            lat = float(coord_matches[0][0])
+            lng = float(coord_matches[0][1])
 
-        # 방법2: 테이블 td에서 좌표 추출
+        # 속도 추출
+        spd_m = re.search(r'(\d+\.?\d*)\s*(?:Knots|kn|kt)', text, re.IGNORECASE)
+        if spd_m:
+            speed = float(spd_m.group(1))
+
+        # 방향 추출
+        crs_m = re.search(r'Course[:\s]*(\d+\.?\d*)\s*°', text, re.IGNORECASE)
+        if crs_m:
+            course = int(float(crs_m.group(1)))
+
+        # meta 태그에서도 시도
         if lat is None:
-            for td in soup.find_all('td'):
-                txt = td.get_text(strip=True)
-                # "35.12345 / 129.12345" 패턴
-                coord_m = re.match(r'(-?\d+\.\d+)\s*/\s*(-?\d+\.\d+)', txt)
-                if coord_m:
-                    lat = float(coord_m.group(1))
-                    lng = float(coord_m.group(2))
+            for meta in soup2.find_all('meta'):
+                content = meta.get('content', '')
+                geo_m = re.search(r'(-?\d+\.\d+)[,;\s]+(-?\d+\.\d+)', content)
+                if geo_m:
+                    lat = float(geo_m.group(1))
+                    lng = float(geo_m.group(2))
                     break
-                # "N 35° 12.345" 패턴
-                dms_m = re.match(r'([NS])\s*(\d+)[°]\s*(\d+\.?\d*)', txt)
-                if dms_m:
-                    d = float(dms_m.group(2)) + float(dms_m.group(3)) / 60
-                    if dms_m.group(1) == 'S': d = -d
-                    lat = d
 
-        # 방법3: 링크에서 좌표 추출
+        # script 태그에서도 시도
         if lat is None:
-            for a in soup.find_all('a', href=True):
-                m = re.search(r'centerx=(-?\d+\.?\d*)&centery=(-?\d+\.?\d*)', a['href'])
-                if m:
-                    lng = float(m.group(1))
-                    lat = float(m.group(2))
+            for script in soup2.find_all('script'):
+                txt = script.string or ''
+                lat_m = re.search(r'lat["\']?\s*[:=]\s*(-?\d+\.\d+)', txt)
+                lng_m = re.search(r'(?:lng|lon)["\']?\s*[:=]\s*(-?\d+\.\d+)', txt)
+                if lat_m and lng_m:
+                    lat = float(lat_m.group(1))
+                    lng = float(lng_m.group(1))
                     break
 
         if lat is None or lng is None:
@@ -122,13 +137,13 @@ def scrape_vesselfinder(mmsi):
             "lat": round(lat, 6),
             "lng": round(lng, 6),
             "speed": round(speed, 1),
-            "heading": heading,
+            "heading": course,
             "name": ship_name,
             "time_utc": "",
             "timestamp": int(time.time()),
             "is_live": False,
             "age_seconds": 0,
-            "source": "vesselfinder"
+            "source": "myshiptracking"
         }
     except Exception as e:
         print(f"[scrape] MMSI {mmsi} error: {e}")
