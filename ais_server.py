@@ -34,7 +34,8 @@ def health():
 @app.route("/ais", methods=["POST", "OPTIONS"])
 @app.route("/api/ais", methods=["POST", "OPTIONS"])
 @app.route("/", methods=["POST", "OPTIONS"])
-def ais_proxy():
+def ais_proxy(positions = async def fetch_positions(api_key, mmsi_list, timeout=10):
+
     if request.method == "OPTIONS":
         return "", 204
 
@@ -62,7 +63,7 @@ async def fetch_positions(api_key, mmsi_list, timeout=22):
         async with websockets.connect(
             "wss://stream.aisstream.io/v0/stream",
             additional_headers={"Origin": ORIGIN},
-            open_timeout=10,
+            open_timeout=5,
         ) as ws:
             sub = {
                 "APIKey":             api_key,
